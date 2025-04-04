@@ -198,3 +198,178 @@
 (define-read-only (get-dataset-usage (dataset-id uint))
   (default-to { access-count: u0 } (map-get? dataset-usage { dataset-id: dataset-id }))
 )
+
+
+
+(define-map dataset-categories
+    { dataset-id: uint }
+    { category: (string-ascii 50) }
+)
+
+(define-public (set-dataset-category (dataset-id uint) (category (string-ascii 50)))
+    (let
+        ((dataset (unwrap! (map-get? datasets { dataset-id: dataset-id }) err-not-found)))
+        (asserts! (is-eq tx-sender (get provider dataset)) err-unauthorized)
+        (map-set dataset-categories
+            { dataset-id: dataset-id }
+            { category: category }
+        )
+        (ok true)
+    )
+)
+
+
+(define-map dataset-reviews
+    { dataset-id: uint, reviewer: principal }
+    { review: (string-ascii 500), timestamp: uint }
+)
+
+(define-public (add-review (dataset-id uint) (review-text (string-ascii 500)))
+    (let
+        ((subscription (unwrap! (map-get? subscriptions { dataset-id: dataset-id, subscriber: tx-sender }) err-unauthorized)))
+        (asserts! (<= stacks-block-height (get expiry subscription)) err-unauthorized)
+        (map-set dataset-reviews
+            { dataset-id: dataset-id, reviewer: tx-sender }
+            { review: review-text, timestamp: stacks-block-height }
+        )
+        (ok true)
+    )
+)
+
+
+(define-constant discount-threshold u3)
+(define-constant discount-percentage u10)
+
+(define-public (bulk-subscribe (dataset-ids (list 10 uint)))
+    (let
+        ((prices (map get-dataset-price dataset-ids))
+         (total-price (fold + prices u0))
+         (discounted-price (if (>= (len dataset-ids) discount-threshold)
+            (- total-price (/ (* total-price discount-percentage) u100))
+            total-price)))
+        (try! (subscribe-multiple dataset-ids discounted-price))
+        (ok true)
+    )
+)
+
+(define-private (get-dataset-price (dataset-id uint))
+    (get price (unwrap! (map-get? datasets { dataset-id: dataset-id }) u0))
+)
+
+(define-private (subscribe-single (dataset-id uint))
+    (let
+        ((current-block-height stacks-block-height)
+         (expiry-height (+ current-block-height u1440)))
+        (map-set subscriptions
+            { dataset-id: dataset-id, subscriber: tx-sender }
+            { expiry: expiry-height }
+        )
+    )
+)
+
+(define-private (subscribe-multiple (dataset-ids (list 10 uint)) (total-price uint))
+    (begin
+        (try! (stx-transfer? total-price tx-sender (as-contract tx-sender)))
+        (map subscribe-single dataset-ids)
+        (ok true)
+    )
+)
+
+
+(define-map dataset-versions
+    { dataset-id: uint, version: uint }
+    { 
+        update-notes: (string-ascii 500),
+        timestamp: uint
+    }
+)
+
+(define-data-var version-counter uint u1)
+
+(define-public (update-dataset (dataset-id uint) (update-notes (string-ascii 500)))
+    (let
+        ((dataset (unwrap! (map-get? datasets { dataset-id: dataset-id }) err-not-found))
+         (current-version (var-get version-counter)))
+        (asserts! (is-eq tx-sender (get provider dataset)) err-unauthorized)
+        (map-set dataset-versions
+            { dataset-id: dataset-id, version: current-version }
+            { update-notes: update-notes, timestamp: stacks-block-height }
+        )
+        (var-set version-counter (+ current-version u1))
+        (ok true)
+    )
+)
+
+
+(define-map referral-rewards
+    { referrer: principal }
+    { total-rewards: uint }
+)
+
+(define-constant referral-percentage u5)
+
+(define-public (subscribe-with-referral (dataset-id uint) (referrer principal))
+    (let
+        ((dataset (unwrap! (map-get? datasets { dataset-id: dataset-id }) err-not-found))
+         (price (get price dataset))
+         (reward-amount (/ (* price referral-percentage) u100)))
+        (try! (subscribe-to-dataset dataset-id))
+        (match (map-get? referral-rewards { referrer: referrer })
+            existing-rewards (map-set referral-rewards
+                { referrer: referrer }
+                { total-rewards: (+ (get total-rewards existing-rewards) reward-amount) })
+            (map-set referral-rewards
+                { referrer: referrer }
+                { total-rewards: reward-amount })
+        )
+        (try! (stx-transfer? reward-amount (as-contract tx-sender) referrer))
+        (ok true)
+    )
+)
+
+
+(define-map featured-datasets
+    { dataset-id: uint }
+    { featured: bool }
+)
+
+(define-public (set-featured-dataset (dataset-id uint) (featured bool))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (unwrap! (map-get? datasets { dataset-id: dataset-id }) err-not-found)
+        (map-set featured-datasets
+            { dataset-id: dataset-id }
+            { featured: featured }
+        )
+        (ok true)
+    )
+)
+
+
+(define-map dataset-analytics
+    { dataset-id: uint }
+    {
+        daily-views: uint,
+        weekly-views: uint,
+        monthly-revenue: uint,
+        last-accessed: uint
+    }
+)
+
+(define-public (record-dataset-access (dataset-id uint))
+    (let
+        ((dataset (unwrap! (map-get? datasets { dataset-id: dataset-id }) err-not-found))
+         (current-analytics (default-to { daily-views: u0, weekly-views: u0, monthly-revenue: u0, last-accessed: u0 }
+            (map-get? dataset-analytics { dataset-id: dataset-id }))))
+        (map-set dataset-analytics
+            { dataset-id: dataset-id }
+            {
+                daily-views: (+ (get daily-views current-analytics) u1),
+                weekly-views: (+ (get weekly-views current-analytics) u1),
+                monthly-revenue: (+ (get monthly-revenue current-analytics) (get price dataset)),
+                last-accessed: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
