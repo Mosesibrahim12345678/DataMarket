@@ -373,3 +373,226 @@
         (ok true)
     )
 )
+
+
+;; Track subscription renewal counts
+(define-map subscription-renewals
+  { dataset-id: uint, subscriber: principal }
+  { renewal-count: uint }
+)
+
+;; Constants for loyalty discount
+(define-constant renewal-discount-tier1 u5)  ;; 5% discount after 1 renewal
+(define-constant renewal-discount-tier2 u10) ;; 10% discount after 3 renewals
+(define-constant renewal-discount-tier3 u15) ;; 15% discount after 5 renewals
+
+;; Calculate discount based on renewal count
+(define-private (calculate-renewal-discount (renewal-count uint))
+  (if (>= renewal-count u5)
+    renewal-discount-tier3
+    (if (>= renewal-count u3)
+      renewal-discount-tier2
+      (if (>= renewal-count u1)
+        renewal-discount-tier1
+        u0
+      )
+    )
+  )
+)
+
+;; Renew an existing subscription
+(define-public (renew-subscription (dataset-id uint))
+  (let
+    (
+      (dataset (unwrap! (map-get? datasets { dataset-id: dataset-id }) err-not-found))
+      (subscription (unwrap! (map-get? subscriptions { dataset-id: dataset-id, subscriber: tx-sender }) err-not-found))
+      (current-renewal-data (default-to { renewal-count: u0 } 
+                            (map-get? subscription-renewals { dataset-id: dataset-id, subscriber: tx-sender })))
+      (renewal-count (+ (get renewal-count current-renewal-data) u1))
+      (renewal-discount (calculate-renewal-discount (get renewal-count current-renewal-data)))
+      (original-price (get price dataset))
+      (discount-amount (/ (* original-price renewal-discount) u100))
+      (discounted-price (- original-price discount-amount))
+      (current-block-height stacks-block-height)
+      (new-expiry-height (+ current-block-height u1440))
+    )
+    
+    ;; Check if dataset is active
+    (asserts! (get active dataset) err-not-found)
+    
+    ;; Transfer discounted payment from subscriber to provider
+    (try! (stx-transfer? discounted-price tx-sender (get provider dataset)))
+    
+    ;; Update subscription expiry
+    (map-set subscriptions
+      { dataset-id: dataset-id, subscriber: tx-sender }
+      { expiry: new-expiry-height }
+    )
+    
+    ;; Update renewal count
+    (map-set subscription-renewals
+      { dataset-id: dataset-id, subscriber: tx-sender }
+      { renewal-count: renewal-count }
+    )
+    
+    ;; Update usage statistics
+    (match (map-get? dataset-usage { dataset-id: dataset-id })
+      existing-usage (map-set dataset-usage
+                      { dataset-id: dataset-id }
+                      { access-count: (+ (get access-count existing-usage) u1) })
+      (map-set dataset-usage
+        { dataset-id: dataset-id }
+        { access-count: u1 })
+    )
+    
+    (ok { renewal-count: renewal-count, discount-percentage: renewal-discount, price-paid: discounted-price })
+  )
+)
+
+;; Get renewal information for a subscriber
+(define-read-only (get-renewal-info (dataset-id uint) (subscriber principal))
+  (default-to { renewal-count: u0 } 
+    (map-get? subscription-renewals { dataset-id: dataset-id, subscriber: subscriber }))
+)
+
+;; Track dataset bundles
+(define-map dataset-bundles
+  { bundle-id: uint }
+  {
+    provider: principal,
+    name: (string-ascii 100),
+    description: (string-ascii 500),
+    dataset-ids: (list 10 uint),
+    price: uint,
+    active: bool
+  }
+)
+
+;; Track bundle subscriptions
+(define-map bundle-subscriptions
+  { bundle-id: uint, subscriber: principal }
+  { expiry: uint }
+)
+
+;; Track next bundle ID
+(define-data-var next-bundle-id uint u1)
+
+;; Create a new dataset bundle
+(define-public (create-dataset-bundle 
+                (name (string-ascii 100)) 
+                (description (string-ascii 500)) 
+                (dataset-ids (list 10 uint)) 
+                (bundle-price uint))
+  (let
+    (
+      (bundle-id (var-get next-bundle-id))
+      (datasets-exist (fold check-datasets-exist dataset-ids true))
+      (datasets-owned (fold check-datasets-owned dataset-ids true))
+    )
+    
+    ;; Check if all datasets exist and are owned by the creator
+    (asserts! datasets-exist err-not-found)
+    (asserts! datasets-owned err-unauthorized)
+    
+    ;; Create the bundle
+    (map-set dataset-bundles
+      { bundle-id: bundle-id }
+      {
+        provider: tx-sender,
+        name: name,
+        description: description,
+        dataset-ids: dataset-ids,
+        price: bundle-price,
+        active: true
+      }
+    )
+    
+    ;; Increment bundle ID for next creation
+    (var-set next-bundle-id (+ bundle-id u1))
+    
+    (ok bundle-id)
+  )
+)
+
+;; Helper to check if datasets exist
+(define-private (check-datasets-exist (dataset-id uint) (previous-result bool))
+  (if previous-result
+    (is-some (map-get? datasets { dataset-id: dataset-id }))
+    false
+  )
+)
+
+;; Helper to check if datasets are owned by the creator
+(define-private (check-datasets-owned (dataset-id uint) (previous-result bool))
+  (if previous-result
+    (match (map-get? datasets { dataset-id: dataset-id })
+      dataset (is-eq (get provider dataset) tx-sender)
+      false
+    )
+    false
+  )
+)
+
+;; Subscribe to a bundle
+(define-public (subscribe-to-bundle (bundle-id uint))
+  (let
+    (
+      (bundle (unwrap! (map-get? dataset-bundles { bundle-id: bundle-id }) err-not-found))
+      (price (get price bundle))
+      (provider (get provider bundle))
+      (dataset-ids (get dataset-ids bundle))
+      (current-block-height stacks-block-height)
+      (expiry-height (+ current-block-height u1440))
+    )
+    
+    ;; Check if bundle is active
+    (asserts! (get active bundle) err-not-found)
+    
+    ;; Transfer payment from subscriber to provider
+    (try! (stx-transfer? price tx-sender provider))
+    
+    ;; Record bundle subscription
+    (map-set bundle-subscriptions
+      { bundle-id: bundle-id, subscriber: tx-sender }
+      { expiry: expiry-height }
+    )
+    
+    ;; Record individual dataset subscriptions
+    (map subscribe-to-bundle-dataset dataset-ids)
+    
+    (ok true)
+  )
+)
+
+;; Helper to subscribe to individual datasets in a bundle
+(define-private (subscribe-to-bundle-dataset (dataset-id uint))
+  (begin
+    (map-set subscriptions
+      { dataset-id: dataset-id, subscriber: tx-sender }
+      { expiry: (+ stacks-block-height u1440) }
+    )
+    
+    ;; Update usage statistics
+    (match (map-get? dataset-usage { dataset-id: dataset-id })
+      existing-usage (map-set dataset-usage
+                      { dataset-id: dataset-id }
+                      { access-count: (+ (get access-count existing-usage) u1) })
+      (map-set dataset-usage
+        { dataset-id: dataset-id }
+        { access-count: u1 })
+    )
+  )
+)
+
+;; Get bundle details
+(define-read-only (get-bundle (bundle-id uint))
+  (map-get? dataset-bundles { bundle-id: bundle-id })
+)
+
+;; Check if user has active bundle subscription
+(define-read-only (has-bundle-subscription (bundle-id uint) (user principal))
+  (match (map-get? bundle-subscriptions { bundle-id: bundle-id, subscriber: user })
+    subscription (ok (< stacks-block-height (get expiry subscription)))
+    (ok false)
+  )
+)
