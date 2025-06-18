@@ -101,6 +101,8 @@
     
     ;; check if dataset is active
     (asserts! (get active dataset) err-not-found)
+    (asserts! (is-dataset-quality-verified dataset-id) (err u999))
+
     
     ;; transfer payment from subscriber to provider
     (try! (stx-transfer? price tx-sender provider))
@@ -595,4 +597,8 @@
     subscription (ok (< stacks-block-height (get expiry subscription)))
     (ok false)
   )
+)
+
+(define-read-only (is-dataset-quality-verified (dataset-id uint))
+  (contract-call? .DataQualityAssurance is-dataset-verified dataset-id)
 )
